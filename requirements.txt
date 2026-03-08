@@ -5,3 +5,5 @@ plotly
 shapely
 trimesh
 pyarrow
+gymnasium
+stable-baselines3
