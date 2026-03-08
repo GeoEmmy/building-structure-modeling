@@ -188,20 +188,20 @@ def auto_structure_model(floor_area, num_floors, span, floor_height, offset=(0, 
 def create_polygon_slab(polygon, thickness, z_position, part_type="slab"):
     """polygon 형태 그대로 슬라브 메쉬 생성 (삼각화 사용)"""
     try:
-        # triangle 엔진 사용하여 extrude
-        slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="triangle")
+        # mapbox_earcut 엔진 우선 사용 (Cloud 호환)
+        slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="earcut")
         slab_mesh.apply_translation([0, 0, z_position])
         slab_mesh.metadata["type"] = part_type
         return slab_mesh
     except Exception as e1:
         try:
-            # mapbox_earcut 엔진으로 시도
-            slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="earcut")
+            # triangle 엔진으로 시도 (로컬 환경)
+            slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="triangle")
             slab_mesh.apply_translation([0, 0, z_position])
             slab_mesh.metadata["type"] = part_type
             return slab_mesh
         except Exception as e2:
-            # 수동으로 메쉬 생성
+            # 수동으로 메쉬 생성 (fallback)
             return create_polygon_mesh_manual(polygon, thickness, z_position, part_type)
 
 
@@ -578,11 +578,24 @@ def try_load_trained_model():
 df = load_data()
 st.title("📐 지번 기반 구조 자동 모델링")
 
+# SAC 모델 사용 가능 여부 확인
+SAC_AVAILABLE = False
+try:
+    from stable_baselines3 import SAC
+    SAC_AVAILABLE = True
+except ImportError:
+    pass
+
 # 모드 선택
 st.sidebar.header("🎯 모델링 모드")
+if SAC_AVAILABLE:
+    mode_options = ["📐 규칙 기반", "🔍 휴리스틱 최적화", "🤖 강화학습 (SAC)"]
+else:
+    mode_options = ["📐 규칙 기반", "🔍 휴리스틱 최적화"]
+
 optimization_mode = st.sidebar.radio(
     "최적화 방식 선택",
-    ["📐 규칙 기반", "🔍 휴리스틱 최적화", "🤖 강화학습 (SAC)"],
+    mode_options,
     index=0
 )
 
