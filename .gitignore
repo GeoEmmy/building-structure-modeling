@@ -1,0 +1,29 @@
+# Data files
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Logs and models
+*_logs/
+*.zip
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Streamlit
+.streamlit/
+
+# Other
+get-pip.py
