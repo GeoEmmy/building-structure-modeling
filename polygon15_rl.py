@@ -253,16 +253,16 @@ def create_polygon_mesh_manual(polygon, thickness, z_position, part_type="slab")
 
 
 def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basement_floors=0):
-    """비정형 polygon 형태 그대로 구조물 생성"""
-    from shapely.geometry import Point
+    """비정형 polygon 형태 구조물 생성 (바운딩 박스 기준 기둥/보 축열)"""
 
     bounds = mass_polygon.bounds  # (minx, miny, maxx, maxy)
     minx, miny, maxx, maxy = bounds
     width = maxx - minx
     height = maxy - miny
 
-    num_grids_x = int(width // span) + 2
-    num_grids_y = int(height // span) + 2
+    # 바운딩 박스 기준 그리드 수 계산
+    num_grids_x = int(width // span) + 1
+    num_grids_y = int(height // span) + 1
 
     column_size = (0.6, 0.6, floor_height)
     beam_size_x = (span, 0.3, 0.6)
@@ -271,42 +271,34 @@ def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basem
     foundation_thickness = 0.6
     boxes = []
 
-    # polygon을 로컬 좌표로 변환 (한 번만)
+    # polygon을 로컬 좌표로 변환 (슬라브용)
     local_poly = shapely.affinity.translate(mass_polygon, xoff=-minx, yoff=-miny)
 
-    # polygon 내부 그리드 포인트 찾기
-    grid_points = []
-    for i in range(num_grids_x):
-        for j in range(num_grids_y):
-            x = minx + i * span
-            y = miny + j * span
-            if mass_polygon.contains(Point(x, y)) or mass_polygon.buffer(0.5).contains(Point(x, y)):
-                grid_points.append((i, j, x, y))
-
-    grid_set = {(p[0], p[1]) for p in grid_points}
-
     def add_floor_elements(z_base, is_foundation=False):
-        # 기둥
-        for i, j, x, y in grid_points:
-            boxes.append(create_box((x - minx, y - miny, z_base + column_size[2] / 2), column_size, part_type="column"))
+        # 기둥 (바운딩 박스 그리드 기준)
+        for i in range(num_grids_x):
+            for j in range(num_grids_y):
+                x = i * span
+                y = j * span
+                boxes.append(create_box((x, y, z_base + column_size[2] / 2), column_size, part_type="column"))
 
-        # X방향 보
-        for i, j, x, y in grid_points:
-            if (i + 1, j) in grid_set:
-                bx = x - minx + span / 2
-                by = y - miny
+        # X방향 보 (바운딩 박스 그리드 기준)
+        for i in range(num_grids_x - 1):
+            for j in range(num_grids_y):
+                bx = (i + 0.5) * span
+                by = j * span
                 boxes.append(create_box((bx, by, z_base + floor_height - beam_size_x[2] / 2), beam_size_x, part_type="beam_x"))
 
-        # Y방향 보
-        for i, j, x, y in grid_points:
-            if (i, j + 1) in grid_set:
-                bx = x - minx
-                by = y - miny + span / 2
+        # Y방향 보 (바운딩 박스 그리드 기준)
+        for i in range(num_grids_x):
+            for j in range(num_grids_y - 1):
+                bx = i * span
+                by = (j + 0.5) * span
                 boxes.append(create_box((bx, by, z_base + floor_height - beam_size_y[2] / 2), beam_size_y, part_type="beam_y"))
 
         # 슬라브 (polygon 형태 그대로)
         slab_thick = foundation_thickness if is_foundation else slab_thickness
-        z_slab = z_base if is_foundation else z_base
+        z_slab = z_base
         part_type = "foundation" if is_foundation else "slab"
 
         slab_mesh = create_polygon_slab(local_poly, slab_thick, z_slab, part_type)
@@ -323,7 +315,7 @@ def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basem
         z_base = floor * floor_height
         add_floor_elements(z_base)
 
-        # 상부 슬라브 (천장)
+        # 상부 슬라브 (천장) - polygon 형태
         top_slab = create_polygon_slab(local_poly, slab_thickness, z_base + floor_height, "slab")
         boxes.append(top_slab)
 
