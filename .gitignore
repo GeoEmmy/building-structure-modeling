@@ -1,5 +1,5 @@
-# Data files
-*.parquet
+# Data files (keep parquet for web deployment)
+# *.parquet
 
 # Python
 __pycache__/
