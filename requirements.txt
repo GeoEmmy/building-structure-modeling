@@ -8,3 +8,4 @@ pyarrow
 gymnasium
 mapbox-earcut
 scipy
+stable-baselines3
