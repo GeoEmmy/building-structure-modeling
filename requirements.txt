@@ -2,8 +2,9 @@ streamlit
 geopandas
 numpy
 plotly
-shapely
+shapely>=2.0
 trimesh
 pyarrow
 gymnasium
 mapbox-earcut
+scipy
