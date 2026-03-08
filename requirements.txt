@@ -7,3 +7,5 @@ trimesh
 pyarrow
 gymnasium
 stable-baselines3
+mapbox-earcut
+triangle
