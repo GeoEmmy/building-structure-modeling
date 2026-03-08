@@ -253,10 +253,19 @@ def create_polygon_mesh_manual(polygon, thickness, z_position, part_type="slab")
 
 
 def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basement_floors=0):
-    """비정형 polygon 형태 그대로 구조물 생성"""
+    """비정형 polygon 형태 구조물 생성 (매스라인 방향에 맞춘 축열)"""
     from shapely.geometry import Point
 
-    bounds = mass_polygon.bounds  # (minx, miny, maxx, maxy)
+    # 1. 최소 회전 사각형으로 주축 방향 찾기
+    min_rect = mass_polygon.minimum_rotated_rectangle
+    angle = get_longest_edge_angle(min_rect)
+    centroid = mass_polygon.centroid
+
+    # 2. polygon을 주축 방향으로 회전 (world 축에 정렬)
+    aligned_poly = shapely.affinity.rotate(mass_polygon, -math.degrees(angle), origin=centroid)
+
+    # 3. 정렬된 polygon의 바운딩 박스 기준으로 그리드 생성
+    bounds = aligned_poly.bounds  # (minx, miny, maxx, maxy)
     minx, miny, maxx, maxy = bounds
     width = maxx - minx
     height = maxy - miny
@@ -271,33 +280,33 @@ def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basem
     foundation_thickness = 0.6
     boxes = []
 
-    # polygon을 로컬 좌표로 변환 (한 번만)
-    local_poly = shapely.affinity.translate(mass_polygon, xoff=-minx, yoff=-miny)
-
-    # polygon 내부 그리드 포인트 찾기
+    # 정렬된 polygon 내부 그리드 포인트 찾기
     grid_points = []
     for i in range(num_grids_x):
         for j in range(num_grids_y):
             x = minx + i * span
             y = miny + j * span
-            if mass_polygon.contains(Point(x, y)) or mass_polygon.buffer(0.5).contains(Point(x, y)):
+            if aligned_poly.contains(Point(x, y)) or aligned_poly.buffer(0.5).contains(Point(x, y)):
                 grid_points.append((i, j, x, y))
 
     grid_set = {(p[0], p[1]) for p in grid_points}
 
+    # 정렬된 polygon을 로컬 좌표로 변환 (슬라브용)
+    local_aligned_poly = shapely.affinity.translate(aligned_poly, xoff=-minx, yoff=-miny)
+
     def add_floor_elements(z_base, is_foundation=False):
-        # 기둥
+        # 기둥 (정렬된 좌표계에서)
         for i, j, x, y in grid_points:
             boxes.append(create_box((x - minx, y - miny, z_base + column_size[2] / 2), column_size, part_type="column"))
 
-        # X방향 보
+        # X방향 보 (주축 방향)
         for i, j, x, y in grid_points:
             if (i + 1, j) in grid_set:
                 bx = x - minx + span / 2
                 by = y - miny
                 boxes.append(create_box((bx, by, z_base + floor_height - beam_size_x[2] / 2), beam_size_x, part_type="beam_x"))
 
-        # Y방향 보
+        # Y방향 보 (부축 방향)
         for i, j, x, y in grid_points:
             if (i, j + 1) in grid_set:
                 bx = x - minx
@@ -306,10 +315,10 @@ def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basem
 
         # 슬라브 (polygon 형태 그대로)
         slab_thick = foundation_thickness if is_foundation else slab_thickness
-        z_slab = z_base if is_foundation else z_base
+        z_slab = z_base
         part_type = "foundation" if is_foundation else "slab"
 
-        slab_mesh = create_polygon_slab(local_poly, slab_thick, z_slab, part_type)
+        slab_mesh = create_polygon_slab(local_aligned_poly, slab_thick, z_slab, part_type)
         boxes.append(slab_mesh)
 
     # Basement
@@ -324,10 +333,23 @@ def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basem
         add_floor_elements(z_base)
 
         # 상부 슬라브 (천장)
-        top_slab = create_polygon_slab(local_poly, slab_thickness, z_base + floor_height, "slab")
+        top_slab = create_polygon_slab(local_aligned_poly, slab_thickness, z_base + floor_height, "slab")
         boxes.append(top_slab)
 
-    return boxes, (minx, miny)
+    # 4. 모든 박스를 원래 방향으로 회전 (로컬 좌표 중심 기준)
+    local_center = ((maxx - minx) / 2, (maxy - miny) / 2)
+    rotated_boxes = rotate_boxes(boxes, center=local_center, angle_rad=angle)
+
+    # 원점 계산 (회전 후 실제 위치)
+    # 정렬된 polygon의 중심을 기준으로 회전했으므로, 원래 polygon 위치로 변환
+    original_centroid = mass_polygon.centroid
+    aligned_centroid = aligned_poly.centroid
+
+    # 로컬 좌표에서 원래 위치로 오프셋 계산
+    origin_x = original_centroid.x - local_center[0]
+    origin_y = original_centroid.y - local_center[1]
+
+    return rotated_boxes, (origin_x, origin_y)
 
 
 def create_rectangular_structure(width, height, num_floors, span, floor_height, basement_floors=0):
