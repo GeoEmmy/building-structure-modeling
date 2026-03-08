@@ -10,10 +10,10 @@ import math
 import gymnasium as gym
 from gymnasium import spaces
 
-# ==================== RL 환경 ====================
+# ==================== 최적화 환경 ====================
 
 class MassPlacementEnv(gym.Env):
-    """강화학습 기반 매스 배치 환경"""
+    """휴리스틱 최적화 기반 매스 배치 환경"""
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -185,6 +185,209 @@ def auto_structure_model(floor_area, num_floors, span, floor_height, offset=(0, 
 
     return boxes, side_len
 
+def create_polygon_slab(polygon, thickness, z_position, part_type="slab"):
+    """polygon 형태 그대로 슬라브 메쉬 생성 (삼각화 사용)"""
+    try:
+        # triangle 엔진 사용하여 extrude
+        slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="triangle")
+        slab_mesh.apply_translation([0, 0, z_position])
+        slab_mesh.metadata["type"] = part_type
+        return slab_mesh
+    except Exception as e1:
+        try:
+            # mapbox_earcut 엔진으로 시도
+            slab_mesh = trimesh.creation.extrude_polygon(polygon, height=thickness, engine="earcut")
+            slab_mesh.apply_translation([0, 0, z_position])
+            slab_mesh.metadata["type"] = part_type
+            return slab_mesh
+        except Exception as e2:
+            # 수동으로 메쉬 생성
+            return create_polygon_mesh_manual(polygon, thickness, z_position, part_type)
+
+
+def create_polygon_mesh_manual(polygon, thickness, z_position, part_type="slab"):
+    """수동으로 polygon 메쉬 생성 (fallback)"""
+    import numpy as np
+    from shapely.geometry import Polygon
+
+    # polygon 좌표 추출
+    coords = np.array(polygon.exterior.coords[:-1])  # 마지막 점 제외 (시작점과 동일)
+    n = len(coords)
+
+    if n < 3:
+        # 너무 적은 점이면 bounding box로 대체
+        bounds = polygon.bounds
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        center_x = (bounds[0] + bounds[2]) / 2
+        center_y = (bounds[1] + bounds[3]) / 2
+        box = create_box((center_x, center_y, z_position + thickness/2), (width, height, thickness), part_type=part_type)
+        return box
+
+    # 상부/하부 면 vertices
+    bottom_verts = np.column_stack([coords, np.full(n, z_position)])
+    top_verts = np.column_stack([coords, np.full(n, z_position + thickness)])
+    vertices = np.vstack([bottom_verts, top_verts])
+
+    # triangulate 상부/하부 면 (간단한 fan triangulation)
+    bottom_faces = []
+    top_faces = []
+    for i in range(1, n - 1):
+        bottom_faces.append([0, i + 1, i])  # CCW for bottom (reversed)
+        top_faces.append([n, n + i, n + i + 1])  # CCW for top
+
+    # 측면 faces
+    side_faces = []
+    for i in range(n):
+        next_i = (i + 1) % n
+        # 두 개의 삼각형으로 사각형 측면 구성
+        side_faces.append([i, next_i, n + next_i])
+        side_faces.append([i, n + next_i, n + i])
+
+    faces = np.array(bottom_faces + top_faces + side_faces)
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    mesh.fix_normals()
+    mesh.metadata["type"] = part_type
+    return mesh
+
+
+def create_polygon_structure(mass_polygon, num_floors, span, floor_height, basement_floors=0):
+    """비정형 polygon 형태 그대로 구조물 생성"""
+    from shapely.geometry import Point
+
+    bounds = mass_polygon.bounds  # (minx, miny, maxx, maxy)
+    minx, miny, maxx, maxy = bounds
+    width = maxx - minx
+    height = maxy - miny
+
+    num_grids_x = int(width // span) + 2
+    num_grids_y = int(height // span) + 2
+
+    column_size = (0.6, 0.6, floor_height)
+    beam_size_x = (span, 0.3, 0.6)
+    beam_size_y = (0.3, span, 0.6)
+    slab_thickness = 0.2
+    foundation_thickness = 0.6
+    boxes = []
+
+    # polygon을 로컬 좌표로 변환 (한 번만)
+    local_poly = shapely.affinity.translate(mass_polygon, xoff=-minx, yoff=-miny)
+
+    # polygon 내부 그리드 포인트 찾기
+    grid_points = []
+    for i in range(num_grids_x):
+        for j in range(num_grids_y):
+            x = minx + i * span
+            y = miny + j * span
+            if mass_polygon.contains(Point(x, y)) or mass_polygon.buffer(0.5).contains(Point(x, y)):
+                grid_points.append((i, j, x, y))
+
+    grid_set = {(p[0], p[1]) for p in grid_points}
+
+    def add_floor_elements(z_base, is_foundation=False):
+        # 기둥
+        for i, j, x, y in grid_points:
+            boxes.append(create_box((x - minx, y - miny, z_base + column_size[2] / 2), column_size, part_type="column"))
+
+        # X방향 보
+        for i, j, x, y in grid_points:
+            if (i + 1, j) in grid_set:
+                bx = x - minx + span / 2
+                by = y - miny
+                boxes.append(create_box((bx, by, z_base + floor_height - beam_size_x[2] / 2), beam_size_x, part_type="beam_x"))
+
+        # Y방향 보
+        for i, j, x, y in grid_points:
+            if (i, j + 1) in grid_set:
+                bx = x - minx
+                by = y - miny + span / 2
+                boxes.append(create_box((bx, by, z_base + floor_height - beam_size_y[2] / 2), beam_size_y, part_type="beam_y"))
+
+        # 슬라브 (polygon 형태 그대로)
+        slab_thick = foundation_thickness if is_foundation else slab_thickness
+        z_slab = z_base if is_foundation else z_base
+        part_type = "foundation" if is_foundation else "slab"
+
+        slab_mesh = create_polygon_slab(local_poly, slab_thick, z_slab, part_type)
+        boxes.append(slab_mesh)
+
+    # Basement
+    for b in range(basement_floors):
+        z_base = - (b + 1) * floor_height
+        is_foundation = (b == basement_floors - 1)
+        add_floor_elements(z_base, is_foundation=is_foundation)
+
+    # Ground and above-ground floors
+    for floor in range(num_floors):
+        z_base = floor * floor_height
+        add_floor_elements(z_base)
+
+        # 상부 슬라브 (천장)
+        top_slab = create_polygon_slab(local_poly, slab_thickness, z_base + floor_height, "slab")
+        boxes.append(top_slab)
+
+    return boxes, (minx, miny)
+
+
+def create_rectangular_structure(width, height, num_floors, span, floor_height, basement_floors=0):
+    """직사각형 형태의 구조물 생성"""
+    num_grids_x = int(width // span) + 1
+    num_grids_y = int(height // span) + 1
+
+    column_size = (0.6, 0.6, floor_height)
+    beam_x_size = (span, 0.3, 0.6)
+    beam_y_size = (0.3, span, 0.6)
+    slab_thickness = 0.2
+    foundation_thickness = 0.6
+    boxes = []
+
+    # Basement
+    for b in range(basement_floors):
+        z_base = - (b + 1) * floor_height
+        for i in range(num_grids_x):
+            for j in range(num_grids_y):
+                x = i * span
+                y = j * span
+                boxes.append(create_box((x, y, z_base + column_size[2] / 2), column_size, part_type="column"))
+        for i in range(num_grids_x - 1):
+            for j in range(num_grids_y):
+                x = (i + 0.5) * span
+                y = j * span
+                boxes.append(create_box((x, y, z_base + floor_height - beam_x_size[2] / 2), beam_x_size, part_type="beam_x"))
+        for i in range(num_grids_x):
+            for j in range(num_grids_y - 1):
+                x = i * span
+                y = (j + 0.5) * span
+                boxes.append(create_box((x, y, z_base + floor_height - beam_y_size[2] / 2), beam_y_size, part_type="beam_y"))
+        slab_thick = foundation_thickness if (b == basement_floors - 1) else slab_thickness
+        z_slab_center = z_base - slab_thick / 2 if (b == basement_floors - 1) else z_base + slab_thick / 2
+        part = "foundation" if (b == basement_floors - 1) else "slab"
+        boxes.append(create_box((width / 2, height / 2, z_slab_center), (width, height, slab_thick), part_type=part))
+
+    # Ground and above-ground floors
+    for floor in range(num_floors):
+        z_base = floor * floor_height
+        for i in range(num_grids_x):
+            for j in range(num_grids_y):
+                x = i * span
+                y = j * span
+                boxes.append(create_box((x, y, z_base + column_size[2] / 2), column_size, part_type="column"))
+        for i in range(num_grids_x - 1):
+            for j in range(num_grids_y):
+                x = (i + 0.5) * span
+                y = j * span
+                boxes.append(create_box((x, y, z_base + floor_height - beam_x_size[2] / 2), beam_x_size, part_type="beam_x"))
+        for i in range(num_grids_x):
+            for j in range(num_grids_y - 1):
+                x = i * span
+                y = (j + 0.5) * span
+                boxes.append(create_box((x, y, z_base + floor_height - beam_y_size[2] / 2), beam_y_size, part_type="beam_y"))
+        boxes.append(create_box((width / 2, height / 2, z_base + slab_thickness / 2), (width, height, slab_thickness), part_type="slab"))
+        boxes.append(create_box((width / 2, height / 2, z_base + floor_height + slab_thickness / 2), (width, height, slab_thickness), part_type="slab"))
+
+    return boxes
+
 def get_longest_edge_angle(rect: Polygon):
     coords = list(rect.exterior.coords)
     max_len = 0
@@ -238,7 +441,7 @@ def visualize_trimesh_boxes_plotly(boxes, polygon=None, setback=None, mass=None)
     add_boundary_trace(polygon, "대지경계선", "green")
     add_boundary_trace(setback, "유효경계선", "red")
     if mass:
-        add_boundary_trace(mass, "RL 매스", "purple")
+        add_boundary_trace(mass, "최적화 매스", "purple")
 
     fig.update_layout(
         scene=dict(xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)', aspectmode='data'),
@@ -249,7 +452,7 @@ def visualize_trimesh_boxes_plotly(boxes, polygon=None, setback=None, mass=None)
 
 
 def run_rl_optimization(env, num_episodes=100):
-    """RL 탐색으로 최적 매스 찾기 (학습된 모델 없이 탐색)"""
+    """휴리스틱 탐색으로 최적 매스 찾기"""
     best_reward = -float('inf')
     best_action = None
     best_info = None
@@ -295,27 +498,21 @@ def run_rl_optimization(env, num_episodes=100):
 
 def try_load_trained_model():
     """학습된 SAC 모델 로드 시도"""
-    try:
-        from stable_baselines3 import SAC
-        import os
+    import os
 
-        model_paths = [
-            "sac_mass_stable_v1.zip",
-            "sac_mass_stable_v1",
-            "sac_mass_general_v1_stable.zip",
-            "sac_mass_general_v1_stable"
-        ]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_names = ["sac_mass_stable_v1", "sac_mass_general_v1_stable"]
 
-        for path in model_paths:
-            if os.path.exists(path) or os.path.exists(path + ".zip"):
+    for name in model_names:
+        path = os.path.join(script_dir, name + ".zip")
+        if os.path.exists(path):
+            try:
+                from stable_baselines3 import SAC
                 model = SAC.load(path.replace(".zip", ""))
-                return model, path
-        return None, None
-    except ImportError:
-        return None, None
-    except Exception as e:
-        st.warning(f"모델 로드 실패: {e}")
-        return None, None
+                return model, name
+            except Exception as e:
+                return None, str(e)
+    return None, None
 
 
 # ==================== Streamlit UI ====================
@@ -325,13 +522,20 @@ st.title("📐 지번 기반 구조 자동 모델링")
 
 # 모드 선택
 st.sidebar.header("🎯 모델링 모드")
-use_rl = st.sidebar.checkbox("🤖 강화학습(RL) 모드 사용", value=False)
+optimization_mode = st.sidebar.radio(
+    "최적화 방식 선택",
+    ["📐 규칙 기반", "🔍 휴리스틱 최적화", "🤖 강화학습 (SAC)"],
+    index=0
+)
 
-if use_rl:
-    st.sidebar.info("RL 모드: 대지 형상에 최적화된 매스 배치를 탐색합니다.")
+if optimization_mode == "🔍 휴리스틱 최적화":
+    st.sidebar.info("랜덤 탐색 + 로컬 서치로 현재 대지에 최적화된 매스를 찾습니다.")
     rl_episodes = st.sidebar.slider("탐색 횟수", 50, 500, 100, step=50)
+elif optimization_mode == "🤖 강화학습 (SAC)":
+    st.sidebar.info("학습된 SAC 신경망으로 빠르게 매스를 배치합니다.")
+    st.sidebar.warning("⚠️ 일반화 성능이 낮을 수 있음")
 else:
-    st.sidebar.info("규칙 기반 모드: 정사각형 그리드로 구조물을 배치합니다.")
+    st.sidebar.info("정사각형 그리드로 구조물을 배치합니다.")
 
 # 디폴트 주소
 def_시도 = "서울특별시"
@@ -357,7 +561,12 @@ def_부번 = 0
 스팬 = st.number_input("기둥 스팬 거리 (m)", value=6.0, step=0.5)
 지하층수 = st.number_input("지하층 수", min_value=0, step=1, value=1)
 
-button_label = "🤖 RL 최적화 + 모델 생성" if use_rl else "🔍 모델 생성"
+if optimization_mode == "📐 규칙 기반":
+    button_label = "📐 모델 생성"
+elif optimization_mode == "🔍 휴리스틱 최적화":
+    button_label = "🔍 휴리스틱 최적화 + 모델 생성"
+else:
+    button_label = "🤖 강화학습 + 모델 생성"
 
 if st.button(button_label):
     filtered = df[
@@ -385,10 +594,11 @@ if st.button(button_label):
 
     mass_polygon = None
     rl_info = None
+    use_optimization = optimization_mode != "📐 규칙 기반"
 
-    if use_rl:
-        # RL 모드
-        st.subheader("🤖 강화학습 최적화 진행 중...")
+    if optimization_mode == "🔍 휴리스틱 최적화":
+        # 휴리스틱 최적화 모드
+        st.subheader("🔍 휴리스틱 최적화 진행 중...")
 
         config = {
             "setback": setback,
@@ -401,59 +611,108 @@ if st.button(button_label):
         }
         env = MassPlacementEnv(config)
 
-        # 학습된 모델 시도
-        model, model_path = try_load_trained_model()
+        best_action, rl_info, best_reward = run_rl_optimization(env, num_episodes=rl_episodes)
 
-        if model is not None:
-            st.success(f"✅ 학습된 모델 로드: {model_path}")
-            obs, info = env.reset()
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, _, _, rl_info = env.step(action)
+        if rl_info:
             mass_polygon = rl_info.get("mass")
-        else:
-            st.info("📊 학습된 모델이 없어 탐색 기반 최적화를 진행합니다...")
-            best_action, rl_info, best_reward = run_rl_optimization(env, num_episodes=rl_episodes)
-
-            if rl_info:
-                mass_polygon = rl_info.get("mass")
-                st.success(f"✅ 최적화 완료! 최고 보상: {best_reward:.2f}")
+            st.success(f"✅ 최적화 완료! 최고 보상: {best_reward:.2f}")
 
         if mass_polygon and isinstance(mass_polygon, Polygon) and mass_polygon.area > 0:
             건축면적 = mass_polygon.area
             연면적 = rl_info.get("연면적", 건축면적 * (용적률 / 건폐율))
             층수 = rl_info.get("층수", max(1, int(min(연면적 / 건축면적, 최대높이 // 층고))))
 
-            st.markdown("### 📊 RL 최적화 결과")
+            st.markdown("### 📊 휴리스틱 최적화 결과")
             col1, col2, col3 = st.columns(3)
             col1.metric("건축면적", f"{건축면적:.1f}㎡")
             col2.metric("연면적", f"{연면적:.1f}㎡")
             col3.metric("층수", f"{층수}층")
         else:
-            st.warning("⚠️ RL 최적화 실패. 규칙 기반 모드로 전환합니다.")
-            use_rl = False
+            st.warning("⚠️ 휴리스틱 최적화 실패. 규칙 기반 모드로 전환합니다.")
+            use_optimization = False
 
-    if not use_rl or mass_polygon is None:
+    elif optimization_mode == "🤖 강화학습 (SAC)":
+        # 강화학습 모드
+        st.subheader("🤖 강화학습 (SAC) 추론 중...")
+
+        config = {
+            "setback": setback,
+            "site_polygon": polygon,
+            "대지면적": 대지면적,
+            "건폐율": 건폐율,
+            "용적률": 용적률,
+            "최대높이": 최대높이,
+            "층고": 층고
+        }
+        env = MassPlacementEnv(config)
+
+        model, model_info = try_load_trained_model()
+
+        if model is not None:
+            st.success(f"✅ 학습된 모델 로드: {model_info}")
+            obs, info = env.reset()
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, _, _, rl_info = env.step(action)
+            mass_polygon = rl_info.get("mass")
+
+            if mass_polygon and isinstance(mass_polygon, Polygon) and mass_polygon.area > 0:
+                건축면적 = mass_polygon.area
+                연면적 = rl_info.get("연면적", 건축면적 * (용적률 / 건폐율))
+                층수 = rl_info.get("층수", max(1, int(min(연면적 / 건축면적, 최대높이 // 층고))))
+
+                st.markdown("### 📊 강화학습 추론 결과")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("건축면적", f"{건축면적:.1f}㎡")
+                col2.metric("연면적", f"{연면적:.1f}㎡")
+                col3.metric("층수", f"{층수}층")
+            else:
+                st.warning("⚠️ 강화학습 최적화 실패. 규칙 기반 모드로 전환합니다.")
+                use_optimization = False
+        else:
+            st.error(f"❌ 모델 로드 실패: {model_info}")
+            st.warning("⚠️ 규칙 기반 모드로 전환합니다.")
+            use_optimization = False
+
+    if not use_optimization or mass_polygon is None:
         # 규칙 기반 모드
         건축면적 = 유효면적 * 건폐율
         연면적 = 건축면적 * (용적률 / 건폐율)
         층수 = max(1, int(min(연면적 / 건축면적, 최대높이 // 층고)))
 
-    side_len = np.sqrt(건축면적)
-    center = setback.centroid
-    origin_x = center.x - side_len / 2
-    origin_y = center.y - side_len / 2
+    # mass_polygon이 있으면 그 형상 그대로 구조물 배치 (비정형)
+    if mass_polygon and isinstance(mass_polygon, Polygon) and mass_polygon.area > 0:
+        # 비정형 polygon 구조물 생성
+        boxes, (minx, miny) = create_polygon_structure(
+            mass_polygon=mass_polygon,
+            num_floors=층수,
+            span=스팬,
+            floor_height=층고,
+            basement_floors=지하층수
+        )
 
-    # 구조 모델 생성
-    boxes, _ = auto_structure_model(
-        floor_area=건축면적,
-        num_floors=층수,
-        span=스팬,
-        floor_height=층고,
-        offset=(0, 0),
-        basement_floors=지하층수
-    )
-    angle = get_longest_edge_angle(setback.minimum_rotated_rectangle)
-    rotated_boxes = rotate_boxes(boxes, center=(side_len / 2, side_len / 2), angle_rad=angle)
+        # 비정형은 회전 없음 (이미 polygon 형태 그대로)
+        rotated_boxes = boxes
+        origin_x = minx
+        origin_y = miny
+
+    else:
+        # 규칙 기반: 정사각형
+        side_len = np.sqrt(건축면적)
+        width = height = side_len
+        center = setback.centroid
+        origin_x = center.x - side_len / 2
+        origin_y = center.y - side_len / 2
+
+        boxes, _ = auto_structure_model(
+            floor_area=건축면적,
+            num_floors=층수,
+            span=스팬,
+            floor_height=층고,
+            offset=(0, 0),
+            basement_floors=지하층수
+        )
+        angle = get_longest_edge_angle(setback.minimum_rotated_rectangle)
+        rotated_boxes = rotate_boxes(boxes, center=(side_len / 2, side_len / 2), angle_rad=angle)
 
     polygon_local = shapely.affinity.translate(polygon, xoff=-origin_x, yoff=-origin_y)
     setback_local = shapely.affinity.translate(setback, xoff=-origin_x, yoff=-origin_y)
@@ -464,8 +723,10 @@ if st.button(button_label):
     st.markdown(f"✅ **대지면적**: {대지면적:.1f}㎡ | **유효면적**: {유효면적:.1f}㎡")
     st.markdown(f"🏢 **건축면적**: {건축면적:.1f}㎡ | **연면적**: {연면적:.1f}㎡ | **지상층수**: {층수}층 | **지하층수**: {지하층수}층")
 
-    if use_rl and mass_polygon:
-        st.markdown("🤖 **모드**: 강화학습 최적화")
+    if optimization_mode == "🔍 휴리스틱 최적화" and mass_polygon:
+        st.markdown("🔍 **모드**: 휴리스틱 최적화")
+    elif optimization_mode == "🤖 강화학습 (SAC)" and mass_polygon:
+        st.markdown("🤖 **모드**: 강화학습 (SAC)")
     else:
         st.markdown("📐 **모드**: 규칙 기반")
 
