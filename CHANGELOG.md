@@ -1,5 +1,23 @@
 # Changelog
 
+## [2026-03-09]
+
+### Added
+- Streamlit Cloud 배포 지원
+  - `packages.txt` 추가 (GDAL 시스템 의존성)
+  - SAC 모델 파일 GitHub 업로드 (`sac_mass_stable_v1.zip`, `sac_mass_general_v1_stable.zip`)
+
+### Changed
+- gymnasium/stable-baselines3 조건부 import (Cloud 호환)
+- `GYMNASIUM_AVAILABLE`, `SAC_AVAILABLE` 플래그로 모드 활성화 결정
+- earcut 삼각화 엔진 우선 사용 (Cloud에서 triangle 컴파일 불가)
+
+### Fixed
+- 그리드 포인트를 원본 좌표계로 역회전하여 기둥/보가 슬라브 내부에 배치되도록 수정
+- 슬라브를 원본 mass polygon 형태로 생성 (회전 없이)
+
+---
+
 ## [2026-03-08]
 
 ### Added
